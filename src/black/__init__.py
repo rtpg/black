@@ -117,7 +117,7 @@ class InvalidInput(ValueError):
     """Raised when input source code fails all parse attempts."""
 
 
-class BracketMatchError(KeyError):
+class BracketMatchError(Exception):
     """Raised when an opening bracket is unable to be matched to a closing bracket."""
 
 
@@ -2142,7 +2142,7 @@ class LineGenerator(Visitor[Line]):
         self.current_line = Line(mode=self.mode)
 
         v = self.visit_stmt
-        Ø: Set[str] = set()
+        empty_set: Set[str] = set()
         self.visit_assert_stmt = partial(v, keywords={"assert"}, parens={"assert", ","})
         self.visit_if_stmt = partial(
             v, keywords={"if", "else", "elif"}, parens={"if", "elif"}
@@ -2150,16 +2150,16 @@ class LineGenerator(Visitor[Line]):
         self.visit_while_stmt = partial(v, keywords={"while", "else"}, parens={"while"})
         self.visit_for_stmt = partial(v, keywords={"for", "else"}, parens={"for", "in"})
         self.visit_try_stmt = partial(
-            v, keywords={"try", "except", "else", "finally"}, parens=Ø
+            v, keywords={"try", "except", "else", "finally"}, parens=empty_set
         )
-        self.visit_except_clause = partial(v, keywords={"except"}, parens=Ø)
-        self.visit_with_stmt = partial(v, keywords={"with"}, parens=Ø)
-        self.visit_funcdef = partial(v, keywords={"def"}, parens=Ø)
-        self.visit_classdef = partial(v, keywords={"class"}, parens=Ø)
-        self.visit_expr_stmt = partial(v, keywords=Ø, parens=ASSIGNMENTS)
+        self.visit_except_clause = partial(v, keywords={"except"}, parens=empty_set)
+        self.visit_with_stmt = partial(v, keywords={"with"}, parens=empty_set)
+        self.visit_funcdef = partial(v, keywords={"def"}, parens=empty_set)
+        self.visit_classdef = partial(v, keywords={"class"}, parens=empty_set)
+        self.visit_expr_stmt = partial(v, keywords=empty_set, parens=ASSIGNMENTS)
         self.visit_return_stmt = partial(v, keywords={"return"}, parens={"return"})
-        self.visit_import_from = partial(v, keywords=Ø, parens={"import"})
-        self.visit_del_stmt = partial(v, keywords=Ø, parens={"del"})
+        self.visit_import_from = partial(v, keywords=empty_set, parens={"import"})
+        self.visit_del_stmt = partial(v, keywords=empty_set, parens={"del"})
         self.visit_async_funcdef = self.visit_async_stmt
         self.visit_decorated = self.visit_decorators
 
@@ -2797,8 +2797,7 @@ def transform_line(
         yield line
 
 
-@dataclass  # type: ignore
-class StringTransformer(ABC):
+class StringTransformer:
     """
     An implementation of the Transformer protocol that relies on its
     subclasses overriding the template methods `do_match(...)` and
@@ -2828,6 +2827,10 @@ class StringTransformer(ABC):
     line_length: int
     normalize_strings: bool
     __name__ = "StringTransformer"
+
+    def __init__(self, line_length: int, normalize_strings: bool) -> None:
+        self.line_length = line_length
+        self.normalize_strings = normalize_strings
 
     @abstractmethod
     def do_match(self, line: Line) -> TMatchResult:
@@ -2919,18 +2922,21 @@ class CustomSplit:
     break_idx: int
 
 
-class CustomSplitMapMixin:
+CustomSplitMaxMixinKey = Tuple[StringID, str]
+class CustomSplitMap:
     """
     This mixin class is used to map merged strings to a sequence of
     CustomSplits, which will then be used to re-split the strings iff none of
     the resultant substrings go over the configured max line length.
     """
 
-    _Key = Tuple[StringID, str]
-    _CUSTOM_SPLIT_MAP: Dict[_Key, Tuple[CustomSplit, ...]] = defaultdict(tuple)
+    _CUSTOM_SPLIT_MAP: Dict[Tuple[StringID, str], Tuple[CustomSplit, ...]]
+
+    def __init__(self) -> None:
+        self._CUSTOM_SPLIT_MAP = defaultdict(tuple)
 
     @staticmethod
-    def _get_key(string: str) -> "CustomSplitMapMixin._Key":
+    def _get_key(string: str) -> Tuple[StringID, str]:
         """
         Returns:
             A unique identifier that is used internally to map @string to a
@@ -2978,7 +2984,7 @@ class CustomSplitMapMixin:
         return key in self._CUSTOM_SPLIT_MAP
 
 
-class StringMerger(CustomSplitMapMixin, StringTransformer):
+class StringMerger(StringTransformer):
     """StringTransformer that merges strings together.
 
     Requirements:
@@ -2997,6 +3003,8 @@ class StringMerger(CustomSplitMapMixin, StringTransformer):
     Collaborations:
         StringMerger provides custom split information to StringSplitter.
     """
+
+    csm: CustomSplitMap = CustomSplitMap()
 
     def do_match(self, line: Line) -> TMatchResult:
         LL = line.leaves
@@ -3219,7 +3227,7 @@ class StringMerger(CustomSplitMapMixin, StringTransformer):
 
             append_leaves(new_line, line, [leaf])
 
-        self.add_custom_splits(string_leaf.value, custom_splits)
+        self.csm.add_custom_splits(string_leaf.value, custom_splits)
         return Ok(new_line)
 
     @staticmethod
@@ -3650,7 +3658,7 @@ class BaseStringSplitter(StringTransformer):
         return max_string_length
 
 
-class StringSplitter(CustomSplitMapMixin, BaseStringSplitter):
+class StringSplitter(BaseStringSplitter):
     """
     StringTransformer that splits "atom" strings (i.e. strings which exist on
     lines by themselves).
@@ -3700,6 +3708,8 @@ class StringSplitter(CustomSplitMapMixin, BaseStringSplitter):
         )+?
     (?<!\}) \} (?:\}\})* (?!\})
     """
+
+    csm: CustomSplitMap = CustomSplitMap()
 
     def do_splitter_match(self, line: Line) -> TMatchResult:
         LL = line.leaves
@@ -3808,7 +3818,7 @@ class StringSplitter(CustomSplitMapMixin, BaseStringSplitter):
             return
 
         # Check if StringMerger registered any custom splits.
-        custom_splits = self.pop_custom_splits(LL[string_idx].value)
+        custom_splits = self.csm.pop_custom_splits(LL[string_idx].value)
         # We use them ONLY if none of them would produce lines that exceed the
         # line limit.
         use_custom_breakpoints = bool(
@@ -4082,7 +4092,7 @@ class StringSplitter(CustomSplitMapMixin, BaseStringSplitter):
             return string
 
 
-class StringParenWrapper(CustomSplitMapMixin, BaseStringSplitter):
+class StringParenWrapper(BaseStringSplitter):
     """
     StringTransformer that splits non-"atom" strings (i.e. strings that do not
     exist on lines by themselves).
@@ -4131,6 +4141,7 @@ class StringParenWrapper(CustomSplitMapMixin, BaseStringSplitter):
         parentheses it created.
     """
 
+    csm: CustomSplitMap = CustomSplitMap()
     def do_splitter_match(self, line: Line) -> TMatchResult:
         LL = line.leaves
 
@@ -4150,7 +4161,7 @@ class StringParenWrapper(CustomSplitMapMixin, BaseStringSplitter):
                 max_string_length = self.line_length - ((line.depth + 1) * 4)
                 if len(string_value) > max_string_length:
                     # And has no associated custom splits...
-                    if not self.has_custom_splits(string_value):
+                    if not self.csm.has_custom_splits(string_value):
                         # Then we should NOT put this string on its own line.
                         return TErr(
                             "We do not wrap long strings in parentheses when the"
@@ -6330,8 +6341,8 @@ def _stringify_ast(
     for field in sorted(node._fields):  # noqa: F402
         # TypeIgnore has only one field 'lineno' which breaks this comparison
         type_ignore_classes = (ast3.TypeIgnore, ast27.TypeIgnore)
-        if sys.version_info >= (3, 8):
-            type_ignore_classes += (ast.TypeIgnore,)
+        # if sys.version_info >= (3, 8):
+        #    type_ignore_classes += (ast.TypeIgnore,)
         if isinstance(node, type_ignore_classes):
             break
 
@@ -6721,8 +6732,8 @@ def _can_omit_closing_paren(line: Line, *, last: Leaf, line_length: int) -> bool
 
 def last_two_except(leaves: List[Leaf], omit: Collection[LeafID]) -> Tuple[Leaf, Leaf]:
     """Return (penultimate, last) leaves skipping brackets in `omit` and contents."""
-    stop_after = None
-    last = None
+    stop_after: Optional[Leaf]= None
+    last: Optional[Leaf] = None
     for leaf in reversed(leaves):
         if stop_after:
             if leaf is stop_after:
